@@ -221,3 +221,14 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+.env
+*.env
+state.json
+*state.json
+cookies*.json
+session*
+*.session
+*.mp4
+*.png
+downloads/
