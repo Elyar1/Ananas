@@ -29,6 +29,28 @@ def parse_caption(text):
 def shot(page, name):
     page.screenshot(path=f"{name}.png", full_page=True)
 
+def add_tags(page, tags):
+    page.get_by_text("برچسب‌های ویدیو").first.click()
+    page.wait_for_timeout(600)
+    tag_in = page.locator("input[placeholder='جستجو...']:visible").last
+    for t in tags:
+        tag_in.click()
+        tag_in.fill(t)
+        tag_in.press("Enter")
+        page.wait_for_timeout(700)
+        # fallback: اگر متن هنوز توی اینپوت مونده، دکمه‌ی + رو بزن
+        try:
+            if tag_in.input_value() == t:
+                tag_in.locator("xpath=../..").locator("button").first.click()
+                page.wait_for_timeout(700)
+        except Exception as e:
+            print("tag fallback failed:", t, e)
+    shot(page, "12_tags_typed")
+    page.keyboard.press("Escape")
+    page.wait_for_timeout(500)
+    if page.get_by_text("اجباری است").count():
+        print("WARNING: tags error still showing")
+
 def main(video, caption_file):
     d = parse_caption(open(caption_file, encoding="utf-8").read())
     user, pw = os.environ["APARAT_USER"], os.environ["APARAT_PASS"]
@@ -50,7 +72,6 @@ def main(video, caption_file):
             # file
             page.locator("input[type=file]").first.set_input_files(video)
             page.get_by_placeholder("عنوان ویدیو").wait_for(timeout=60000)
-            shot(page, "10_after_file")
 
             # title + description
             page.get_by_placeholder("عنوان ویدیو").fill(d["title"])
@@ -68,25 +89,19 @@ def main(video, caption_file):
             else:
                 page.get_by_text(d["category"], exact=True).last.click()
             page.wait_for_timeout(500)
-            shot(page, "11_after_category")
 
-            # tags: type + Enter
-            page.get_by_text("برچسب‌های ویدیو").first.click()
-            tag_in = page.locator("input[placeholder='جستجو...']:visible").first
-            for t in d["tags"]:
-                tag_in.fill(t)
-                tag_in.press("Enter")
-                page.wait_for_timeout(500)
-            page.keyboard.press("Escape")
-            shot(page, "12_after_tags")
+            # tags
+            add_tags(page, d["tags"])
+            shot(page, "11_after_tags")
 
             # publish mode
-            if d.get("mode", "").startswith("ذخیره"):
+            save_only = d.get("mode", "").startswith("ذخیره")
+            if save_only:
                 page.get_by_text("انتخاب زمان انتشار").first.click()
                 page.get_by_text("ذخیره و عدم انتشار").click()
-                page.wait_for_timeout(500)
+                page.wait_for_timeout(800)
 
-            # wait for upload to finish (progress like ۴٪ disappears or hits ۱۰۰٪)
+            # wait for upload to finish
             for i in range(360):  # up to 30 min
                 txt = page.inner_text("body")
                 m = re.search(r"([۰-۹0-9]+)\s*٪", txt)
@@ -97,7 +112,11 @@ def main(video, caption_file):
                 page.wait_for_timeout(5000)
             shot(page, "13_before_publish")
 
-            page.get_by_role("button", name=re.compile("انتشار ویدیو|ذخیره")).last.click()
+            # دکمه‌ی نهایی: کنار «انصراف»، نه گزینه‌ی لیست
+            cancel = page.locator("button:has-text('انصراف')").first
+            btn = cancel.locator("xpath=..").locator("button").filter(has_not_text="انصراف").first
+            print("clicking button:", btn.inner_text())
+            btn.click()
             page.wait_for_timeout(10000)
             shot(page, "14_after_publish")
             print("final url:", page.url)
