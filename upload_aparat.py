@@ -29,27 +29,57 @@ def parse_caption(text):
 def shot(page, name):
     page.screenshot(path=f"{name}.png", full_page=True)
 
+def find_tags_input(page):
+    label = page.get_by_text("برچسب‌های ویدیو").first.bounding_box()
+    cands = []
+    for el in page.locator("input[placeholder='جستجو...']:visible").all():
+        bb = el.bounding_box()
+        if bb and bb["y"] >= label["y"]:
+            has_btn = el.evaluate(
+                "e => !!(e.parentElement.querySelector('button') || "
+                "e.parentElement.parentElement.querySelector('button'))")
+            cands.append((bb["y"], has_btn, el))
+            print("candidate input y=%.0f has_button=%s" % (bb["y"], has_btn))
+    cands.sort(key=lambda c: c[0])
+    for y, has_btn, el in cands:
+        if has_btn:
+            return el
+    return cands[min(1, len(cands) - 1)][2]
+
 def add_tags(page, tags):
     page.get_by_text("برچسب‌های ویدیو").first.click()
-    page.wait_for_timeout(600)
-    tag_in = page.locator("input[placeholder='جستجو...']:visible").last
-    for t in tags:
+    page.wait_for_timeout(1000)
+    tag_in = find_tags_input(page)
+
+    # دیباگ: HTML اطراف اینپوت برچسب
+    try:
+        html = tag_in.locator("xpath=ancestor::*[.//button][1]").evaluate("e => e.outerHTML")
+        open("tags_dom.txt", "w", encoding="utf-8").write(html[:6000])
+    except Exception as e:
+        print("dom dump failed:", e)
+
+    for i, t in enumerate(tags):
         tag_in.click()
         tag_in.fill(t)
-        tag_in.press("Enter")
-        page.wait_for_timeout(700)
-        # fallback: اگر متن هنوز توی اینپوت مونده، دکمه‌ی + رو بزن
         try:
-            if tag_in.input_value() == t:
-                tag_in.locator("xpath=../..").locator("button").first.click()
-                page.wait_for_timeout(700)
-        except Exception as e:
-            print("tag fallback failed:", t, e)
-    shot(page, "12_tags_typed")
+            page.get_by_text("در حال جستجو").wait_for(state="hidden", timeout=5000)
+        except Exception:
+            pass
+        shot(page, f"12_tag{i}_typed")
+        tag_in.press("Enter")
+        page.wait_for_timeout(1200)
+        shot(page, f"12_tag{i}_enter")
+        left = tag_in.input_value()
+        print(f"tag {t!r}: input after Enter = {left!r}")
+        if left:  # هنوز مونده: دکمه‌ی +
+            tag_in.locator("xpath=ancestor::*[.//button][1]//button").first.click()
+            page.wait_for_timeout(1000)
+            shot(page, f"12_tag{i}_plus")
+
     page.keyboard.press("Escape")
     page.wait_for_timeout(500)
-    if page.get_by_text("اجباری است").count():
-        print("WARNING: tags error still showing")
+    errs = page.get_by_text("الزامی").count() + page.get_by_text("اجباری").count()
+    print("tags error messages visible:", errs)
 
 def main(video, caption_file):
     d = parse_caption(open(caption_file, encoding="utf-8").read())
