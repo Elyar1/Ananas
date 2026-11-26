@@ -21,4 +21,4 @@ jobs:
           name: upload-shots
           path: |
             *.png
-            tags_dom.txt
+            *.txt
