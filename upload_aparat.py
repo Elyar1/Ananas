@@ -29,52 +29,32 @@ def parse_caption(text):
 def shot(page, name):
     page.screenshot(path=f"{name}.png", full_page=True)
 
-def find_tags_input(page):
-    label = page.get_by_text("برچسب‌های ویدیو").first.bounding_box()
-    cands = []
-    for el in page.locator("input[placeholder='جستجو...']:visible").all():
-        bb = el.bounding_box()
-        if bb and bb["y"] >= label["y"]:
-            has_btn = el.evaluate(
-                "e => !!(e.parentElement.querySelector('button') || "
-                "e.parentElement.parentElement.querySelector('button'))")
-            cands.append((bb["y"], has_btn, el))
-            print("candidate input y=%.0f has_button=%s" % (bb["y"], has_btn))
-    cands.sort(key=lambda c: c[0])
-    for y, has_btn, el in cands:
-        if has_btn:
-            return el
-    return cands[min(1, len(cands) - 1)][2]
-
 def add_tags(page, tags):
-    page.get_by_text("برچسب‌های ویدیو").first.click()
-    page.wait_for_timeout(1000)
-    tag_in = find_tags_input(page)
-
-    # دیباگ: HTML اطراف اینپوت برچسب
-    try:
-        html = tag_in.locator("xpath=ancestor::*[.//button][1]").evaluate("e => e.outerHTML")
-        open("tags_dom.txt", "w", encoding="utf-8").write(html[:6000])
-    except Exception as e:
-        print("dom dump failed:", e)
-
+    label = page.get_by_text("برچسب‌های ویدیو").first
+    add_sel = "button.add-item-btn:visible"
     for i, t in enumerate(tags):
+        if page.locator(add_sel).count() == 0:  # لیست بسته شده؛ دوباره باز کن
+            label.click()
+            page.wait_for_timeout(1000)
+        tag_in = page.locator("input[name='searchbar']:visible").last
         tag_in.click()
         tag_in.fill(t)
-        try:
-            page.get_by_text("در حال جستجو").wait_for(state="hidden", timeout=5000)
-        except Exception:
-            pass
+        page.wait_for_timeout(1500)
         shot(page, f"12_tag{i}_typed")
-        tag_in.press("Enter")
-        page.wait_for_timeout(1200)
-        shot(page, f"12_tag{i}_enter")
-        left = tag_in.input_value()
-        print(f"tag {t!r}: input after Enter = {left!r}")
-        if left:  # هنوز مونده: دکمه‌ی +
-            tag_in.locator("xpath=ancestor::*[.//button][1]//button").first.click()
+        page.locator(add_sel).first.click()
+        page.wait_for_timeout(1500)
+        shot(page, f"12_tag{i}_plus")
+        left = tag_in.input_value() if tag_in.count() else ""
+        print(f"tag {t!r}: input after + = {left!r}")
+        if left:
+            tag_in.press("Enter")
             page.wait_for_timeout(1000)
-            shot(page, f"12_tag{i}_plus")
+        if i == 0:  # دیباگ: HTML کادر برچسب بعد از اولین افزودن
+            try:
+                box = label.locator("xpath=ancestor::*[.//input[@name='searchbar']][1]")
+                open("tags_after.txt", "w", encoding="utf-8").write(box.evaluate("e => e.outerHTML")[:8000])
+            except Exception as e:
+                print("dom dump failed:", e)
 
     page.keyboard.press("Escape")
     page.wait_for_timeout(500)
@@ -89,6 +69,8 @@ def main(video, caption_file):
         browser = p.chromium.launch()
         ctx = browser.new_context(locale="fa-IR", viewport={"width": 1280, "height": 2200})
         page = ctx.new_page()
+        page.on("response", lambda r: print("HTTP", r.request.method, r.status, r.url[:140])
+                if ("tag" in r.url.lower() or r.status >= 400) else None)
         try:
             # login
             page.goto("https://www.aparat.com/login?returnUrl=/reactupload", timeout=45000)
@@ -121,6 +103,8 @@ def main(video, caption_file):
             page.wait_for_timeout(500)
 
             # tags
+            page.get_by_text("برچسب‌های ویدیو").first.click()
+            page.wait_for_timeout(1000)
             add_tags(page, d["tags"])
             shot(page, "11_after_tags")
 
@@ -142,7 +126,7 @@ def main(video, caption_file):
                 page.wait_for_timeout(5000)
             shot(page, "13_before_publish")
 
-            # دکمه‌ی نهایی: کنار «انصراف»، نه گزینه‌ی لیست
+            # دکمه‌ی نهایی: کنار «انصراف»
             cancel = page.locator("button:has-text('انصراف')").first
             btn = cancel.locator("xpath=..").locator("button").filter(has_not_text="انصراف").first
             print("clicking button:", btn.inner_text())
