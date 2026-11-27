@@ -31,7 +31,7 @@ async def main():
         path = await client.download_media(msg, file=f"dl_{MSG_ID}")
         meta = {"path": path, "caption": msg.message or "",
                 "size": os.path.getsize(path), "secs": round(time.time() - t0)}
-        with open("meta.json", "w", encoding="utf-8") as fh:
+        with open(f"meta_{MSG_ID}.json", "w", encoding="utf-8") as fh:
             json.dump(meta, fh, ensure_ascii=False)
         print("stage: download ok")
     except SystemExit:
