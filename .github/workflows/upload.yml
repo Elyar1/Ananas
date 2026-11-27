@@ -1,0 +1,36 @@
+name: aparat-upload
+on:
+  workflow_dispatch:
+    inputs:
+      message_id:
+        required: true
+      model:
+        default: ""
+      ai:
+        default: "0"
+permissions:
+  contents: read
+concurrency:
+  group: aparat-upload
+  cancel-in-progress: false
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -q --disable-pip-version-check telethon cryptg playwright requests && playwright install --with-deps chromium
+      - run: python run_upload.py
+        env:
+          MESSAGE_IDS: ${{ inputs.message_id }}
+          MODEL: ${{ inputs.model }}
+          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+          TG_API_ID: ${{ secrets.TG_API_ID }}
+          TG_API_HASH: ${{ secrets.TG_API_HASH }}
+          TG_OWNER_ID: ${{ secrets.TG_OWNER_ID }}
+          APARAT_USER: ${{ secrets.APARAT_USER }}
+          APARAT_PASS: ${{ secrets.APARAT_PASS }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
