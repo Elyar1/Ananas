@@ -8,6 +8,10 @@ on:
         default: ""
       ai:
         default: "0"
+      sched_start:
+        default: ""
+      sched_step:
+        default: ""
 permissions:
   contents: read
 concurrency:
@@ -22,11 +26,13 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - run: pip install -q --disable-pip-version-check telethon cryptg playwright requests && playwright install --with-deps chromium
+      - run: pip install -q --disable-pip-version-check telethon cryptg playwright requests jdatetime && playwright install --with-deps chromium
       - run: python run_upload.py
         env:
           MESSAGE_IDS: ${{ inputs.message_id }}
           MODEL: ${{ inputs.model }}
+          SCHED_START: ${{ inputs.sched_start }}
+          SCHED_STEP: ${{ inputs.sched_step }}
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_API_ID: ${{ secrets.TG_API_ID }}
           TG_API_HASH: ${{ secrets.TG_API_HASH }}
