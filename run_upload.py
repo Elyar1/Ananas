@@ -1,4 +1,5 @@
 import os, re, sys, json, difflib, subprocess
+from collections import Counter
 import requests
 from playwright.sync_api import sync_playwright
 
@@ -8,11 +9,12 @@ USER = os.environ["APARAT_USER"]
 PASS = os.environ["APARAT_PASS"]
 GEMINI_KEY = os.environ.get("GEMINI_API_KEY", "")
 MODEL = os.environ.get("MODEL") or "gemini-3.5-flash-lite"
-IDS = [int(x) for x in re.split(r"[,\s]+", os.environ["MESSAGE_IDS"]) if x.strip()]
+IDS = list(dict.fromkeys(int(x) for x in re.split(r"[,\s]+", os.environ["MESSAGE_IDS"]) if x.strip()))
 MIN_TAGS, MAX_TAGS = 3, 5
 PL_MAX, PL_WARN = 100, 90
 API = f"https://api.telegram.org/bot{TOKEN}"
 STATE = {"cats": None, "playlists": {}}
+procs = {}
 
 FALLBACK_CATS = ["خانه و زندگی", "محیط زیست", "مالی و اقتصادی", "اجتماعی", "علوم پایه",
                  "فرهنگ و هنر", "استایل و مد", "سلامت و تندرستی", "غذا و نوشیدنی",
@@ -22,6 +24,7 @@ FALLBACK_CATS = ["خانه و زندگی", "محیط زیست", "مالی و ا�
 KEYS = {"عنوان": "title", "توضیحات": "description", "دسته": "category",
         "برچسب": "tags", "انتشار": "mode"}
 PAT = re.compile(r"^\s*(عنوان|توضیحات|دسته|برچسب(?:\u200c?ها)?|انتشار)\s*[:：]\s*(.*)$")
+LINK_RE = re.compile(r"(?:https?://)?(?:www\.)?aparat\.com/v/([A-Za-z0-9_-]+)")
 
 SYSTEM = """You prepare Aparat (Persian video site) metadata for a channel owner.
 Return ONLY a JSON object with keys: title, description, category, tags, playlist.
@@ -32,39 +35,6 @@ Return ONLY a JSON object with keys: title, description, category, tags, playlis
 - tags: array of 3 to 5 short Persian tags (1-3 words, no commas).
 - playlist: MUST be copied exactly from PLAYLISTS, or "" if none fits.
 - If a field is listed in already_provided, repeat it unchanged."""
-
-JS_READ = r"""
-async () => {
-  const cands = [...document.querySelectorAll("input[name='searchbar'], input[placeholder='جستجو...']")]
-    .filter(e => e.offsetParent !== null);
-  const inp = cands.find(e => e.name === "searchbar") || cands[0];
-  if (!inp) return [];
-  let sc = null, root = inp.parentElement;
-  for (let i = 0; i < 6 && root && !sc; i++, root = root.parentElement) {
-    sc = [root, ...root.querySelectorAll("*")].find(e => {
-      const s = getComputedStyle(e);
-      return (s.overflowY === "auto" || s.overflowY === "scroll") && e.scrollHeight > e.clientHeight + 5;
-    }) || null;
-  }
-  const seen = new Set(), out = [];
-  const grab = (el) => el.querySelectorAll("*").forEach(n => {
-    if (n.children.length === 0) {
-      const t = (n.textContent || "").replace(/\s+/g, " ").trim();
-      if (t && !seen.has(t)) { seen.add(t); out.push(t); }
-    }
-  });
-  if (!sc) { grab(inp.parentElement.parentElement); return out; }
-  sc.scrollTop = 0;
-  for (let i = 0; i < 40; i++) {
-    grab(sc);
-    const before = sc.scrollTop;
-    sc.scrollTop = before + Math.max(sc.clientHeight * 0.8, 50);
-    await new Promise(r => setTimeout(r, 150));
-    if (sc.scrollTop === before) break;
-  }
-  return out;
-}
-"""
 
 # ---------------- helpers ----------------
 def notify(text):
@@ -105,6 +75,10 @@ def closest(v, options):
         return v
     m = difflib.get_close_matches(v, options, n=1, cutoff=0.6)
     return m[0] if m else ""
+
+def start_fetch(mid):
+    if mid not in procs:
+        procs[mid] = subprocess.Popen([sys.executable, "tg_fetch.py", str(mid)])
 
 # ---------------- gemini ----------------
 def gemini(model, system, user):
@@ -213,19 +187,30 @@ def dd_search(page):
         loc = page.locator("input[placeholder='جستجو...']:visible")
     return loc.first
 
+def page_lines(page):
+    return [l.strip() for l in page.inner_text("body").splitlines() if l.strip()]
+
 def read_categories(page):
     close_dd(page)
+    base = Counter(page_lines(page))
     page.get_by_text("دسته‌بندی آپارات").first.click()
     page.wait_for_timeout(1000)
-    items = page.evaluate(JS_READ)
+    try:
+        box = dd_search(page).bounding_box()
+    except Exception:
+        box = None
+    found = []
+    for _ in range(14):
+        for line, n in Counter(page_lines(page)).items():
+            if (n > base.get(line, 0) and line not in found and len(line) > 1
+                    and not line.startswith("جستجو") and "در حال جستجو" not in line):
+                found.append(line)
+        if box:
+            page.mouse.move(box["x"] + 100, box["y"] + 140)
+        page.mouse.wheel(0, 250)
+        page.wait_for_timeout(300)
     close_dd(page)
-    out = []
-    for t in items:
-        t = t.strip()
-        if len(t) < 2 or t.startswith("جستجو") or "در حال جستجو" in t or t in out:
-            continue
-        out.append(t)
-    return out
+    return found
 
 def pick(page, label, text):
     close_dd(page)
@@ -266,15 +251,29 @@ def add_tags(page, tags):
     page.keyboard.press("Escape")
     page.wait_for_timeout(500)
 
-def process(ctx, idx, total, mid):
+def find_link(page):
+    try:
+        extra = page.evaluate("""() => [...document.querySelectorAll('input,textarea')].map(e => e.value || '')
+            .concat([...document.querySelectorAll('a[href]')].map(a => a.href))""")
+    except Exception:
+        extra = []
+    txt = "\n".join(extra) + "\n" + page.inner_text("body")
+    m = LINK_RE.search(txt)
+    return "https://www.aparat.com/v/" + m.group(1) if m else None
+
+def process(ctx, idx, total, mid, proc, start_next):
     tag = f"[{idx}/{total}] "
     stage, page, path = "download", None, None
     try:
-        if subprocess.run([sys.executable, "tg_fetch.py", str(mid)]).returncode != 0:
+        rc = proc.wait()
+        start_next()  # دانلود ویدیوی بعدی هم‌زمان با آپلود این یکی
+        if rc != 0:
             print("stage failed: download")
-            return False  # tg_fetch already notified
-        with open("meta.json", encoding="utf-8") as fh:
+            return False  # tg_fetch خودش خطا رو گزارش کرده
+        meta_file = f"meta_{mid}.json"
+        with open(meta_file, encoding="utf-8") as fh:
             meta = json.load(fh)
+        os.remove(meta_file)
         path, caption = meta["path"], meta["caption"]
         notify(f"{tag}⬇️ دانلود شد ({meta['size']/1e6:.0f} MB، {meta['secs']} ثانیه). آپلود شروع شد.")
         f = parse_caption(caption)
@@ -335,13 +334,12 @@ def process(ctx, idx, total, mid):
         stage = "get link"
         link = None
         for _ in range(40):
-            m = re.search(r"https?://(?:www\.)?aparat\.com/v/\w+", page.inner_text("body"))
-            if m:
-                link = m.group(0)
+            link = find_link(page)
+            if link:
                 break
             page.wait_for_timeout(2000)
         if not link:
-            raise RuntimeError("لینک ویدیو پیدا نشد (شاید ثبت نشده)")
+            raise RuntimeError("لینک ویدیو پیدا نشد. متن صفحه: " + page.inner_text("body")[:400].replace("\n", " | "))
 
         if pl_note not in ("—", "انتخاب نشد"):
             STATE["playlists"][fin["playlist"]] = STATE["playlists"].get(fin["playlist"], 0) + 1
@@ -377,6 +375,8 @@ def process(ctx, idx, total, mid):
             os.remove(path)
 
 def main():
+    if IDS:
+        start_fetch(IDS[0])  # دانلود اولی هم‌زمان با لاگین و خوندن لیست‌ها
     with sync_playwright() as p:
         browser = p.chromium.launch()
         ctx = browser.new_context(locale="fa-IR", viewport={"width": 1280, "height": 2200})
@@ -397,7 +397,9 @@ def main():
             notify(f"⚠️ لیست‌های پخش خونده نشد ({type(e).__name__}). ویدیوها بدون لیست آپلود می‌شن.")
         ok = 0
         for i, mid in enumerate(IDS, 1):
-            if process(ctx, i, len(IDS), mid):
+            nxt = IDS[i] if i < len(IDS) else None
+            start_next = (lambda n=nxt: start_fetch(n)) if nxt is not None else (lambda: None)
+            if process(ctx, i, len(IDS), mid, procs.pop(mid), start_next):
                 ok += 1
         if len(IDS) > 1:
             notify(f"پایان: {ok} از {len(IDS)} ویدیو موفق")
