@@ -1,0 +1,23 @@
+name: aparat-playlists
+on: workflow_dispatch
+permissions:
+  contents: read
+concurrency:
+  group: aparat-lists
+  cancel-in-progress: false
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -q --disable-pip-version-check playwright && playwright install --with-deps chromium
+      - run: python read_playlists.py
+        env:
+          APARAT_USER: ${{ secrets.APARAT_USER }}
+          APARAT_PASS: ${{ secrets.APARAT_PASS }}
+          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+          TG_OWNER_ID: ${{ secrets.TG_OWNER_ID }}
