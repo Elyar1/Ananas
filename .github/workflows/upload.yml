@@ -1,0 +1,34 @@
+name: aparat-upload
+on:
+  workflow_dispatch:
+    inputs:
+      message_id:
+        required: true
+      model:
+        default: ""
+      ai:
+        default: "0"
+permissions:
+  contents: read
+concurrency:
+  group: aparat-upload
+  cancel-in-progress: false
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -q --disable-pip-version-check telethon cryptg
+      - run: python fetch_video.py
+        env:
+          MESSAGE_ID: ${{ inputs.message_id }}
+          MODEL: ${{ inputs.model }}
+          AI: ${{ inputs.ai }}
+          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+          TG_API_ID: ${{ secrets.TG_API_ID }}
+          TG_API_HASH: ${{ secrets.TG_API_HASH }}
+          TG_OWNER_ID: ${{ secrets.TG_OWNER_ID }}
