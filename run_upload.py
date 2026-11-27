@@ -1,5 +1,6 @@
-import os, re, sys, json, difflib, subprocess
+import os, re, sys, json, difflib, subprocess, datetime as dt
 from collections import Counter
+import jdatetime
 import requests
 from playwright.sync_api import sync_playwright
 
@@ -9,17 +10,38 @@ USER = os.environ["APARAT_USER"]
 PASS = os.environ["APARAT_PASS"]
 GEMINI_KEY = os.environ.get("GEMINI_API_KEY", "")
 MODEL = os.environ.get("MODEL") or "gemini-3.5-flash-lite"
-IDS = list(dict.fromkeys(int(x) for x in re.split(r"[,\s]+", os.environ["MESSAGE_IDS"]) if x.strip()))
+SCHED_START = os.environ.get("SCHED_START", "").strip()
+SCHED_STEP = int(os.environ.get("SCHED_STEP") or 0)
+DEVICE_RE = re.compile(os.environ.get("DEVICE_PATTERN") or "Linux")
 MIN_TAGS, MAX_TAGS = 3, 5
 PL_MAX, PL_WARN = 100, 90
 API = f"https://api.telegram.org/bot{TOKEN}"
-STATE = {"cats": None, "playlists": {}}
+STATE = {"cats": None, "playlists": {}, "last_slot": None}
 procs = {}
+TEHRAN = dt.timezone(dt.timedelta(hours=3, minutes=30))
+
+def parse_items(s):
+    out, seen = [], set()
+    for part in re.split(r"[,\s]+", s):
+        if not part.strip():
+            continue
+        v, _, c = part.partition("+")
+        v = int(v)
+        if v in seen:
+            continue
+        seen.add(v)
+        out.append((v, int(c) if c.strip() else None))
+    return out
+
+ITEMS = parse_items(os.environ["MESSAGE_IDS"])
 
 FALLBACK_CATS = ["خانه و زندگی", "محیط زیست", "مالی و اقتصادی", "اجتماعی", "علوم پایه",
                  "فرهنگ و هنر", "استایل و مد", "سلامت و تندرستی", "غذا و نوشیدنی",
                  "خودرو و وسایل نقلیه", "کودک و خانواده", "قانون و سیاست",
                  "فناوری و رایانه", "سفر و گردشگری", "حیوانات", "کسب و کار"]
+MONTHS = ["فروردین", "اردیبهشت", "خرداد", "تیر", "مرداد", "شهریور",
+          "مهر", "آبان", "آذر", "دی", "بهمن", "اسفند"]
+HDR = re.compile("(" + "|".join(MONTHS) + r")\s+([0-9۰-۹]{4})")
 
 KEYS = {"عنوان": "title", "توضیحات": "description", "دسته": "category",
         "برچسب": "tags", "انتشار": "mode"}
@@ -50,6 +72,10 @@ def notify_photo(png, caption):
     except Exception:
         print("notify failed")
 
+FA_DIGITS = str.maketrans("0123456789", "۰۱۲۳۴۵۶۷۸۹")
+def fa(n):
+    return str(n).translate(FA_DIGITS)
+
 def to_int(s):
     s = s.translate(str.maketrans("۰۱۲۳۴۵۶۷۸۹٠١٢٣٤٥٦٧٨٩", "01234567890123456789"))
     m = re.search(r"\d+", s)
@@ -79,6 +105,16 @@ def closest(v, options):
 def start_fetch(mid):
     if mid not in procs:
         procs[mid] = subprocess.Popen([sys.executable, "tg_fetch.py", str(mid)])
+
+def fetch_now(mid):
+    rc = subprocess.run([sys.executable, "tg_fetch.py", str(mid)]).returncode
+    if rc != 0:
+        return None
+    mf = f"meta_{mid}.json"
+    with open(mf, encoding="utf-8") as fh:
+        meta = json.load(fh)
+    os.remove(mf)
+    return meta
 
 # ---------------- gemini ----------------
 def gemini(model, system, user):
@@ -130,7 +166,7 @@ def build_fields(f, caption, cats, open_lists):
         raise RuntimeError("جمینای فیلدها رو کامل نساخت (عنوان/دسته/برچسب)")
     return out
 
-# ---------------- aparat ----------------
+# ---------------- aparat: login, devices, playlists ----------------
 def login(page):
     page.goto("https://www.aparat.com/login?returnUrl=/reactupload", timeout=45000)
     page.locator("input").first.fill(USER)
@@ -139,6 +175,48 @@ def login(page):
     page.keyboard.press("Enter")
     page.wait_for_url("**/reactupload**", timeout=30000)
     page.wait_for_timeout(2000)
+
+def cleanup_devices(ctx):
+    """دستگاه‌های قدیمی Linux (ران‌های قبلی) رو حذف می‌کنه تا سقف ۱۰ دستگاه پر نشه."""
+    pg = ctx.new_page()
+    removed = 0
+    try:
+        pg.goto("https://www.aparat.com/dashboard/settings/devices", timeout=45000)
+        pg.wait_for_timeout(3000)
+        for _ in range(12):
+            target = None
+            titles = pg.get_by_text(DEVICE_RE)
+            for i in range(titles.count()):
+                row = titles.nth(i).locator("xpath=ancestor::*[.//button][1]")
+                txt = row.inner_text()
+                if len(re.findall(r"WebKit", txt)) != 1 or "آنلاین" in txt:
+                    continue
+                btns = row.locator("button")
+                if btns.count():
+                    target = btns.last
+                    break
+            if target is None:
+                break
+            target.click()
+            pg.wait_for_timeout(700)
+            item = pg.get_by_text(re.compile(r"خروج|حذف|قطع")).first
+            item.click()
+            pg.wait_for_timeout(700)
+            conf = pg.get_by_role("button", name=re.compile(r"^\s*(تأیید|تایید|بله|خروج|حذف)"))
+            if conf.count():
+                conf.last.click()
+            pg.wait_for_timeout(1800)
+            removed += 1
+        if removed:
+            notify(f"🧹 {removed} دستگاه قدیمی آپارات حذف شد.")
+    except Exception as e:
+        print("stage failed: devices")
+        try:
+            notify_photo(pg.screenshot(), f"⚠️ پاک‌سازی دستگاه‌ها ناموفق ({type(e).__name__}). اگه ۱۰ تا پر شده دستی حذف کن.")
+        except Exception:
+            notify(f"⚠️ پاک‌سازی دستگاه‌ها ناموفق ({type(e).__name__}).")
+    finally:
+        pg.close()
 
 def read_playlists(ctx):
     pg = ctx.new_page()
@@ -172,6 +250,7 @@ def read_playlists(ctx):
     finally:
         pg.close()
 
+# ---------------- aparat: form ----------------
 def close_dd(page):
     sel = "input[name='searchbar']:visible"
     if page.locator(sel).count():
@@ -251,6 +330,101 @@ def add_tags(page, tags):
     page.keyboard.press("Escape")
     page.wait_for_timeout(500)
 
+def set_cover(page, cover_path):
+    with page.expect_file_chooser(timeout=15000) as fc:
+        page.get_by_text("بارگذاری تصویر").first.click()
+    fc.value.set_files(cover_path)
+    page.wait_for_timeout(7000)
+
+# ---------------- aparat: schedule ----------------
+def next_slot(k):
+    start = dt.datetime.strptime(SCHED_START, "%Y-%m-%d %H:%M").replace(tzinfo=TEHRAN)
+    slot = start + dt.timedelta(minutes=SCHED_STEP * k)
+    earliest = (dt.datetime.now(TEHRAN) + dt.timedelta(minutes=8)).replace(second=0, microsecond=0)
+    if slot < earliest:
+        slot = earliest
+    last = STATE["last_slot"]
+    if last and slot <= last:
+        slot = last + dt.timedelta(minutes=max(SCHED_STEP, 1))
+    STATE["last_slot"] = slot
+    return slot
+
+def cal_header(dlg):
+    m = HDR.search(dlg.inner_text())
+    return (to_int(m.group(2)), MONTHS.index(m.group(1)) + 1) if m else None
+
+def goto_month(page, dlg, ty, tm):
+    cur = cal_header(dlg)
+    if cur is None:
+        return False
+    if cur == (ty, tm):
+        return True
+    hb = dlg.get_by_text(HDR).first.bounding_box()
+    cy = hb["y"] + hb["height"] / 2
+    arrows = []
+    btns = dlg.locator("button, [role=button]")
+    for i in range(btns.count()):
+        b = btns.nth(i)
+        if (b.inner_text() or "").strip():
+            continue
+        bb = b.bounding_box()
+        if bb and abs(bb["y"] + bb["height"] / 2 - cy) < 30:
+            arrows.append((bb["x"], b))
+    arrows.sort(key=lambda a: a[0])
+    if len(arrows) < 2:
+        return False
+    fwd, back = arrows[0][1], arrows[-1][1]  # در راست‌به‌چپ معمولاً فلش چپ = ماه بعد
+    for _ in range(30):
+        cur = cal_header(dlg)
+        if cur is None:
+            return False
+        if cur == (ty, tm):
+            return True
+        diff = (ty * 12 + tm) - (cur[0] * 12 + cur[1])
+        (fwd if diff > 0 else back).click()
+        page.wait_for_timeout(350)
+        new = cal_header(dlg)
+        if new and new != cur:
+            moved = (new[0] * 12 + new[1]) - (cur[0] * 12 + cur[1])
+            if (moved > 0) != (diff > 0):
+                fwd, back = back, fwd
+    return False
+
+def set_schedule(page, slot):
+    page.get_by_text("انتخاب زمان انتشار").first.click()
+    page.get_by_text("زمان‌بندی انتشار ویدیو").click()
+    page.get_by_text("ساعت انتشار").first.wait_for(timeout=15000)
+    dlg = page.get_by_text("ساعت انتشار").first.locator(
+        "xpath=ancestor::*[.//button[contains(., 'ثبت زمان انتشار')]][1]")
+    jd = jdatetime.date.fromgregorian(year=slot.year, month=slot.month, day=slot.day)
+    if not goto_month(page, dlg, jd.year, jd.month):
+        raise RuntimeError("ماه تقویم پیدا نشد")
+    cells = dlg.get_by_text(re.compile(rf"^\s*({jd.day}|{fa(jd.day)})\s*$"))
+    cand = []
+    for i in range(cells.count()):
+        bb = cells.nth(i).bounding_box()
+        if bb:
+            cand.append((bb["y"], i))
+    if not cand:
+        raise RuntimeError("روز توی تقویم پیدا نشد")
+    cand.sort()
+    # روزهای ماه قبل/بعد هم توی شبکه هستن: روزهای ≥۲۰ پایین‌ترین، روزهای کوچک بالاترین
+    cells.nth((cand[-1] if jd.day >= 20 else cand[0])[1]).click()
+    page.wait_for_timeout(400)
+    ins = [i for i in dlg.locator("input").all() if i.is_visible()]
+    if len(ins) < 2:
+        raise RuntimeError("کادر ساعت و دقیقه پیدا نشد")
+    ins.sort(key=lambda e: e.bounding_box()["x"])
+    ins[0].fill(f"{slot.hour:02d}")
+    ins[1].fill(f"{slot.minute:02d}")
+    page.wait_for_timeout(300)
+    if to_int(ins[0].input_value()) != slot.hour or to_int(ins[1].input_value()) != slot.minute:
+        raise RuntimeError("ساعت درست ثبت نشد")
+    dlg.get_by_role("button", name="ثبت زمان انتشار").click()
+    page.wait_for_timeout(800)
+    return f"{jd.year}/{jd.month:02d}/{jd.day:02d} {slot.hour:02d}:{slot.minute:02d}"
+
+# ---------------- aparat: link ----------------
 def find_link(page):
     try:
         extra = page.evaluate("""() => [...document.querySelectorAll('input,textarea')].map(e => e.value || '')
@@ -261,21 +435,28 @@ def find_link(page):
     m = LINK_RE.search(txt)
     return "https://www.aparat.com/v/" + m.group(1) if m else None
 
-def process(ctx, idx, total, mid, proc, start_next):
+# ---------------- main flow ----------------
+def process(ctx, idx, total, mid, cid, proc, start_next):
     tag = f"[{idx}/{total}] "
-    stage, page, path = "download", None, None
+    stage, page, path, cover_path = "download", None, None, None
     try:
         rc = proc.wait()
         start_next()  # دانلود ویدیوی بعدی هم‌زمان با آپلود این یکی
         if rc != 0:
             print("stage failed: download")
             return False  # tg_fetch خودش خطا رو گزارش کرده
-        meta_file = f"meta_{mid}.json"
-        with open(meta_file, encoding="utf-8") as fh:
+        mf = f"meta_{mid}.json"
+        with open(mf, encoding="utf-8") as fh:
             meta = json.load(fh)
-        os.remove(meta_file)
+        os.remove(mf)
         path, caption = meta["path"], meta["caption"]
         notify(f"{tag}⬇️ دانلود شد ({meta['size']/1e6:.0f} MB، {meta['secs']} ثانیه). آپلود شروع شد.")
+        if cid:
+            cm = fetch_now(cid)
+            if cm:
+                cover_path = cm["path"]
+            else:
+                notify(f"{tag}⚠️ کاور دانلود نشد؛ بدون کاور ادامه می‌دم.")
         f = parse_caption(caption)
         if len(f["tags"]) > MAX_TAGS:
             raise RuntimeError(f"حداکثر {MAX_TAGS} برچسب مجازه")
@@ -318,13 +499,29 @@ def process(ctx, idx, total, mid, proc, start_next):
                 pl_note = fin["playlist"] if pick(page, "ذخیره در لیست پخش", fin["playlist"]) else "انتخاب نشد"
             except Exception:
                 pl_note = "انتخاب نشد"
+
+        sched_note = ""
         if save_only:
             page.get_by_text("انتخاب زمان انتشار").first.click()
             page.get_by_text("ذخیره و عدم انتشار").click()
             page.wait_for_timeout(800)
+        elif SCHED_START and SCHED_STEP:
+            stage = "schedule"
+            sched_note = set_schedule(page, next_slot(idx - 1))
 
         stage = "wait upload"
         page.get_by_text("آماده انتشار").first.wait_for(timeout=45 * 60 * 1000)
+
+        cover_note = "—"
+        if cover_path:
+            stage = "cover"
+            try:
+                set_cover(page, cover_path)
+                cover_note = "✅"
+                if idx == 1:
+                    notify_photo(page.screenshot(), f"{tag}بررسی کاور")
+            except Exception as e:
+                cover_note = f"❌ ({type(e).__name__})"
 
         stage = "publish"
         cancel = page.locator("button:has-text('انصراف')").first
@@ -343,9 +540,14 @@ def process(ctx, idx, total, mid, proc, start_next):
 
         if pl_note not in ("—", "انتخاب نشد"):
             STATE["playlists"][fin["playlist"]] = STATE["playlists"].get(fin["playlist"], 0) + 1
-        notify(f"{tag}{'📝 ذخیره شد (منتشر نشده)' if save_only else '✅ منتشر شد'}\n{link}\n"
-               f"عنوان: {fin['title']}\nدسته: {fin['category']}\n"
-               f"برچسب‌ها: {'، '.join(fin['tags'])}\nلیست: {pl_note}")
+        if save_only:
+            head = "📝 ذخیره شد (منتشر نشده)"
+        elif sched_note:
+            head = f"🕒 زمان‌بندی شد برای {sched_note} (وقت تهران)"
+        else:
+            head = "✅ منتشر شد"
+        notify(f"{tag}{head}\n{link}\nعنوان: {fin['title']}\nدسته: {fin['category']}\n"
+               f"برچسب‌ها: {'، '.join(fin['tags'])}\nلیست: {pl_note}\nکاور: {cover_note}")
         if pl_note not in ("—", "انتخاب نشد"):
             n = STATE["playlists"][fin["playlist"]]
             if n >= PL_WARN:
@@ -371,23 +573,29 @@ def process(ctx, idx, total, mid, proc, start_next):
                 page.close()
             except Exception:
                 pass
-        if path and os.path.exists(path):
-            os.remove(path)
+        for pth in (path, cover_path):
+            if pth and os.path.exists(pth):
+                os.remove(pth)
 
 def main():
-    if IDS:
-        start_fetch(IDS[0])  # دانلود اولی هم‌زمان با لاگین و خوندن لیست‌ها
+    start_fetch(ITEMS[0][0])  # دانلود اولی هم‌زمان با لاگین و خوندن لیست‌ها
     with sync_playwright() as p:
         browser = p.chromium.launch()
-        ctx = browser.new_context(locale="fa-IR", viewport={"width": 1280, "height": 2200})
+        ctx = browser.new_context(locale="fa-IR", timezone_id="Asia/Tehran",
+                                  viewport={"width": 1280, "height": 2200})
+        pg = ctx.new_page()
         try:
-            pg = ctx.new_page()
             login(pg)
-            pg.close()
         except Exception as e:
             print("stage failed: login")
-            notify(f"❌ لاگین آپارات ناموفق: {type(e).__name__}")
+            msg = (f"❌ لاگین آپارات ناموفق: {type(e).__name__}\n"
+                   "اگه ۱۰ دستگاه پر شده، از صفحه‌ی دستگاه‌های آپارات چند تا Linux-WebKit-Chrome رو حذف کن.")
+            try:
+                notify_photo(pg.screenshot(), msg)
+            except Exception:
+                notify(msg)
             sys.exit(1)
+        pg.close()
         try:
             STATE["playlists"] = read_playlists(ctx)
             full = [t for t, c in STATE["playlists"].items() if c >= PL_MAX]
@@ -395,15 +603,16 @@ def main():
         except Exception as e:
             print("stage failed: playlists")
             notify(f"⚠️ لیست‌های پخش خونده نشد ({type(e).__name__}). ویدیوها بدون لیست آپلود می‌شن.")
+        cleanup_devices(ctx)
         ok = 0
-        for i, mid in enumerate(IDS, 1):
-            nxt = IDS[i] if i < len(IDS) else None
+        for i, (mid, cid) in enumerate(ITEMS, 1):
+            nxt = ITEMS[i][0] if i < len(ITEMS) else None
             start_next = (lambda n=nxt: start_fetch(n)) if nxt is not None else (lambda: None)
-            if process(ctx, i, len(IDS), mid, procs.pop(mid), start_next):
+            if process(ctx, i, len(ITEMS), mid, cid, procs.pop(mid), start_next):
                 ok += 1
-        if len(IDS) > 1:
-            notify(f"پایان: {ok} از {len(IDS)} ویدیو موفق")
+        if len(ITEMS) > 1:
+            notify(f"پایان: {ok} از {len(ITEMS)} ویدیو موفق")
         browser.close()
-        sys.exit(0 if ok == len(IDS) else 1)
+        sys.exit(0 if ok == len(ITEMS) else 1)
 
 main()
